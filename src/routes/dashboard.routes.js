@@ -30,6 +30,33 @@ router.get(
          (SELECT COALESCE(SUM(quantity), 0) FROM greenhouse_stage_stock) AS greenhouse_total`
     );
 
+    // Per-location greenhouse stage stock (greenhouse + source locations)
+    const [locationStageStock] = await pool.query(
+      `SELECT l.id AS location_id, l.name AS location_name, l.type AS location_type, l.is_source,
+              gss.stage, COALESCE(gss.quantity, 0) AS quantity
+       FROM locations l
+       LEFT JOIN greenhouse_stage_stock gss ON gss.location_id = l.id
+       WHERE l.status = 'active' AND (l.type = 'greenhouse' OR l.is_source = 1)
+       ORDER BY l.id, gss.stage`
+    );
+
+    // Source location: per-batch inventory
+    const [sourceInventory] = await pool.query(
+      `SELECT si.location_id, l.name AS location_name,
+              b.id AS batch_id, b.batch_code,
+              v.name AS variety_name,
+              st.name AS seedling_type_name,
+              si.current_stage AS stage,
+              COALESCE(si.quantity_available, 0) AS quantity
+       FROM seedling_inventory si
+       JOIN locations l ON l.id = si.location_id
+       JOIN seedling_batches b ON b.id = si.batch_id
+       LEFT JOIN varieties v ON v.id = b.variety_id
+       LEFT JOIN seedling_types st ON st.id = b.seedling_type_id
+       WHERE l.is_source = 1 AND l.status = 'active' AND si.quantity_available > 0
+       ORDER BY l.id, si.quantity_available DESC`
+    );
+
     const [lowStock] = await pool.query(
       `SELECT si.id AS inventory_id, si.quantity_available, si.current_stage,
               b.batch_code, l.name AS location_name, v.name AS variety_name
@@ -52,7 +79,9 @@ router.get(
     return sendOk(res, {
       summary: stats[0],
       lowStock,
-      recentOrders
+      recentOrders,
+      locationStageStock,
+      sourceInventory,
     });
   })
 );

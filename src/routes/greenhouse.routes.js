@@ -54,6 +54,39 @@ async function ensureVarietyStockTable(db) {
   `);
 }
 
+async function ensureGreenhouseTransfersTable(db) {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS greenhouse_transfers (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      transfer_code VARCHAR(80) NOT NULL UNIQUE,
+      from_location_id INT NOT NULL,
+      to_location_id INT NOT NULL,
+      from_stage VARCHAR(50) NOT NULL,
+      to_stage VARCHAR(50) NOT NULL,
+      quantity INT NOT NULL,
+      rootstock_type_id INT NULL,
+      transfer_date DATE NOT NULL,
+      note TEXT NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'pending_head',
+      created_by INT NULL,
+      sender_confirmed TINYINT(1) NOT NULL DEFAULT 1,
+      sender_confirmed_by INT NULL,
+      sender_confirmed_at DATETIME NULL,
+      head_confirmed TINYINT(1) NOT NULL DEFAULT 0,
+      head_confirmed_by INT NULL,
+      head_confirmed_at DATETIME NULL,
+      receiver_confirmed TINYINT(1) NOT NULL DEFAULT 0,
+      receiver_confirmed_by INT NULL,
+      receiver_confirmed_at DATETIME NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_gt_status (status),
+      INDEX idx_gt_from_location (from_location_id),
+      INDEX idx_gt_to_location (to_location_id)
+    )
+  `);
+}
+
 // Nav bo'yicha stokni yangilash
 async function adjustVarietyStock(conn, locationId, stage, varietyId, seedlingTypeId, rootstockTypeId, delta) {
   const vId = varietyId || 0;
@@ -113,6 +146,168 @@ async function getLocationStock(conn, locationId) {
     total: stock.cassette + stock.grafting + stock.grafted + stock.ready,
   };
 }
+
+// ─── GET /api/greenhouse/transfers ──────────────────────────────────────────
+// Teplitsa-to-teplitsa bosqich transferlari ro'yxati
+router.get(
+  "/transfers",
+  asyncHandler(async (_req, res) => {
+    const pool = getPool();
+    await ensureGreenhouseTransfersTable(pool);
+
+    const [rows] = await pool.query(`
+      SELECT gt.*,
+        fl.name AS from_location_name,
+        tl.name AS to_location_name,
+        u1.full_name AS created_by_name,
+        u2.full_name AS sender_confirmed_by_name,
+        u3.full_name AS head_confirmed_by_name,
+        u4.full_name AS receiver_confirmed_by_name,
+        rt.name AS rootstock_type_name
+      FROM greenhouse_transfers gt
+      LEFT JOIN locations fl ON fl.id = gt.from_location_id
+      LEFT JOIN locations tl ON tl.id = gt.to_location_id
+      LEFT JOIN users u1 ON u1.id = gt.created_by
+      LEFT JOIN users u2 ON u2.id = gt.sender_confirmed_by
+      LEFT JOIN users u3 ON u3.id = gt.head_confirmed_by
+      LEFT JOIN users u4 ON u4.id = gt.receiver_confirmed_by
+      LEFT JOIN rootstock_types rt ON rt.id = gt.rootstock_type_id
+      ORDER BY gt.created_at DESC
+      LIMIT 200
+    `);
+
+    return sendOk(res, rows);
+  })
+);
+
+// ─── POST /api/greenhouse/transfers/:id/confirm-head ────────────────────────
+// Bosh agronom tasdiqlaydi → manba teplitsadan stok chiqariladi
+router.post(
+  "/transfers/:id/confirm-head",
+  authorize("admin", "bosh_agranom"),
+  asyncHandler(async (req, res) => {
+    const id = toPositiveInt(req.params.id, "id");
+
+    await ensureLogColumns(getPool());
+
+    const result = await withTransaction(async (conn) => {
+      const [rows] = await conn.query(
+        "SELECT * FROM greenhouse_transfers WHERE id = ? LIMIT 1",
+        [id]
+      );
+      const gt = rows[0];
+      if (!gt) throw new AppError("Greenhouse transfer topilmadi.", 404);
+      if (gt.head_confirmed) throw new AppError("Bosh agronom allaqachon tasdiqlagan.", 400);
+
+      // Manba teplitsada yetarli stok borligini tekshirish
+      const [stockRows] = await conn.query(
+        `SELECT quantity FROM greenhouse_stage_stock WHERE location_id = ? AND stage = ? LIMIT 1`,
+        [gt.from_location_id, gt.from_stage]
+      );
+      const available = Number(stockRows[0]?.quantity || 0);
+      if (available < gt.quantity) {
+        throw new AppError(
+          `Manba teplitsada yetarli miqdor yo'q. Mavjud: ${available}, kerak: ${gt.quantity}.`,
+          400
+        );
+      }
+
+      // Manba teplitsadan stok chiqariladi
+      await adjustStock(conn, gt.from_location_id, gt.from_stage, -gt.quantity);
+
+      // Chiqish logi
+      const transferDate = gt.transfer_date instanceof Date
+        ? gt.transfer_date.toISOString().slice(0, 10)
+        : String(gt.transfer_date).slice(0, 10);
+      await conn.query(
+        `INSERT INTO greenhouse_stage_log
+          (location_id, action_date, from_stage, to_stage, quantity, notes, created_by, action_type, from_rootstock_type_id)
+         VALUES (?, ?, ?, NULL, ?, ?, ?, 'transfer_out', ?)`,
+        [gt.from_location_id, transferDate, gt.from_stage,
+         gt.quantity, gt.note, req.user.id, gt.rootstock_type_id || null]
+      );
+
+      await conn.query(
+        `UPDATE greenhouse_transfers
+         SET head_confirmed = 1, head_confirmed_by = ?, head_confirmed_at = NOW(), status = 'pending_receiver'
+         WHERE id = ?`,
+        [req.user.id, id]
+      );
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "greenhouse_transfer_head_confirmed",
+        entityType: "greenhouse_transfer",
+        entityId: id,
+        description: `Greenhouse transfer #${id} bosh agronom tomonidan tasdiqlandi`
+      });
+
+      return { id, status: "pending_receiver" };
+    });
+
+    return sendOk(res, result, "Bosh agronom tasdig'i saqlandi.");
+  })
+);
+
+// ─── POST /api/greenhouse/transfers/:id/confirm-receiver ────────────────────
+// Qabul qiluvchi tasdiqlaydi → maqsad teplitsaga stok qo'shiladi
+router.post(
+  "/transfers/:id/confirm-receiver",
+  authorize("admin", "bosh_agranom", "agranom"),
+  asyncHandler(async (req, res) => {
+    const id = toPositiveInt(req.params.id, "id");
+
+    await ensureLogColumns(getPool());
+
+    const result = await withTransaction(async (conn) => {
+      const [rows] = await conn.query(
+        "SELECT * FROM greenhouse_transfers WHERE id = ? LIMIT 1",
+        [id]
+      );
+      const gt = rows[0];
+      if (!gt) throw new AppError("Greenhouse transfer topilmadi.", 404);
+      if (!gt.head_confirmed) throw new AppError("Avval bosh agronom tasdiqlashi kerak.", 400);
+      if (gt.receiver_confirmed) throw new AppError("Qabul qiluvchi allaqachon tasdiqlagan.", 400);
+
+      if (req.user.role === "agranom" && req.user.locationId !== gt.to_location_id) {
+        throw new AppError("Siz bu transferni qabul qiluvchi sifatida tasdiqlay olmaysiz.", 403);
+      }
+
+      // Maqsad teplitsaga stok qo'shiladi
+      await adjustStock(conn, gt.to_location_id, gt.to_stage, gt.quantity);
+
+      // Kirim logi
+      const transferDate = gt.transfer_date instanceof Date
+        ? gt.transfer_date.toISOString().slice(0, 10)
+        : String(gt.transfer_date).slice(0, 10);
+      await conn.query(
+        `INSERT INTO greenhouse_stage_log
+          (location_id, action_date, from_stage, to_stage, quantity, notes, created_by, action_type, rootstock_type_id)
+         VALUES (?, ?, NULL, ?, ?, ?, ?, 'transfer_in', ?)`,
+        [gt.to_location_id, transferDate, gt.to_stage, gt.quantity, gt.note, req.user.id, gt.rootstock_type_id || null]
+      );
+
+      await conn.query(
+        `UPDATE greenhouse_transfers
+         SET receiver_confirmed = 1, receiver_confirmed_by = ?, receiver_confirmed_at = NOW(), status = 'completed'
+         WHERE id = ?`,
+        [req.user.id, id]
+      );
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "greenhouse_transfer_receiver_confirmed",
+        entityType: "greenhouse_transfer",
+        entityId: id,
+        description: `Greenhouse transfer #${id} qabul qiluvchi tomonidan tasdiqlandi`
+      });
+
+      return { id, status: "completed" };
+    });
+
+    return sendOk(res, result, "Qabul tasdig'i saqlandi. Ko'chatlar maqsad teplitsada paydo bo'ldi.");
+  })
+);
 
 // ─── GET /api/greenhouse/summary ────────────────────────────────────────────
 // Barcha faol teplitsalar bo'yicha umumiy holat
@@ -222,7 +417,7 @@ router.get(
        LEFT JOIN seedling_types st ON st.id = gsl.seedling_type_id
        LEFT JOIN varieties v ON v.id = gsl.variety_id
        LEFT JOIN rootstock_types rt ON rt.id = gsl.rootstock_type_id
-       WHERE gsl.location_id = ? AND (gsl.action_type IS NULL OR gsl.action_type != 'defect')
+       WHERE gsl.location_id = ? AND (gsl.action_type IS NULL OR gsl.action_type NOT IN ('defect', 'correction'))
        ORDER BY gsl.action_date DESC, gsl.id DESC
        LIMIT ?`,
       [locationId, limit]
@@ -343,39 +538,8 @@ router.post(
     await ensureLogColumns(getPool());
     await ensureVarietyStockTable(getPool());
 
-    // Nav miqdorini normallashtirish uchun scale hisoblaymiz (transaksiyadan tashqarida)
-    // Maqsad: variety_quantity = physical_qty * (varTotal/stageTotal)
-    // Shunda ko'chirish keyin boshqa navlar ko'rsatkichi o'zgarmaydi
-    let varietyNorm = 1;
-    try {
-      const pool = getPool();
-      const [[stockRow]] = await pool.query(
-        `SELECT COALESCE(quantity, 0) AS qty FROM greenhouse_stage_stock
-         WHERE location_id = ? AND stage = ? LIMIT 1`,
-        [locationId, fromStage]
-      );
-      const stageQty = Number(stockRow?.qty || 0);
-      const [varRows] = await pool.query(
-        `SELECT SUM(COALESCE(variety_quantity, quantity)) AS vt
-         FROM (
-           SELECT COALESCE(variety_quantity, quantity) AS variety_quantity
-           FROM greenhouse_stage_log
-           WHERE location_id = ? AND to_stage = ? AND to_stage NOT IN ('defect')
-           UNION ALL
-           SELECT -COALESCE(variety_quantity, quantity)
-           FROM greenhouse_stage_log
-           WHERE location_id = ? AND from_stage = ?
-         ) t`,
-        [locationId, fromStage, locationId, fromStage]
-      );
-      const varTotal = Number(varRows[0]?.vt || 0);
-      if (varTotal > stageQty && stageQty > 0) {
-        varietyNorm = varTotal / stageQty; // > 1: phantom entries bor
-      }
-    } catch (_) {}
-
-    // Fizik miqdorni variety_quantity ga aylantirish
-    const vqty = (q) => Math.round(q * varietyNorm);
+    // Har doim actual miqdorni saqlaymiz (scaling yo'q)
+    const vqty = (q) => q;
 
     const result = await withTransaction(async (conn) => {
       const location = await fetchOne(
@@ -462,23 +626,24 @@ router.post(
         );
       }
 
-      // Payvant olmagan — KASETADA ga qaytariladi (fromStage ga emas)
+      // Payvant olmagan — fromStage ga qaytariladi (kasetaga emas)
       let failedLogId = null;
       if (failedQuantity > 0) {
-        await adjustStock(conn, locationId, "cassette", failedQuantity);
-        await adjustVarietyStock(conn, locationId, "cassette", varietyId, seedlingTypeId, rootstockTypeId, failedQuantity);
+        await adjustStock(conn, locationId, fromStage, failedQuantity);
+        await adjustVarietyStock(conn, locationId, fromStage, varietyId, seedlingTypeId, rootstockTypeId, failedQuantity);
 
         const [failedLog] = await conn.query(
           `INSERT INTO greenhouse_stage_log
             (location_id, action_date, from_stage, to_stage, quantity, notes, created_by, action_type,
              seedling_type_id, variety_id, rootstock_type_id, variety_quantity)
-           VALUES (?, ?, ?, 'cassette', ?, ?, ?, 'return', ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'return', ?, ?, ?, ?)`,
           [
             locationId,
             actionDateStr,
             fromStage,
+            fromStage,
             failedQuantity,
-            `Payvant olmagan: ${failedQuantity} ta kasetaga qaytarildi`,
+            `Payvant olmagan: ${failedQuantity} ta ${fromStage} bosqichida qoldi`,
             req.user.id,
             seedlingTypeId,
             varietyId,
@@ -495,7 +660,7 @@ router.post(
         entityType: "greenhouse",
         entityId: locationId,
         description: `${location.name}: ${fromStage} → ${toStage}, ${quantity} ta` +
-          (failedQuantity > 0 ? `, ${failedQuantity} ta kasetaga qaytarildi` : "") +
+          (failedQuantity > 0 ? `, ${failedQuantity} ta ${fromStage} bosqichida qoldi` : "") +
           (defectQuantity > 0 ? `, ${defectQuantity} ta nobut` : ""),
         metadata: { locationId, fromStage, toStage, quantity, failedQuantity, defectQuantity, actionDate: actionDateStr }
       });
@@ -546,7 +711,7 @@ router.get(
                   CASE WHEN gsl.to_stage IN ('cassette','grafting') THEN 0
                        ELSE COALESCE(gsl.seedling_type_id, 0) END AS seedling_type_id,
                   COALESCE(gsl.rootstock_type_id, 0)             AS rootstock_type_id,
-                  COALESCE(gsl.variety_quantity, gsl.quantity)   AS qty_delta,
+                  gsl.quantity                                    AS qty_delta,
                   CASE WHEN gsl.to_stage IN ('cassette','grafting') THEN NULL
                        ELSE v.name END AS variety_name,
                   CASE WHEN gsl.to_stage IN ('cassette','grafting') THEN NULL
@@ -569,7 +734,7 @@ router.get(
                   CASE WHEN gsl.from_stage IN ('cassette','grafting') THEN 0
                        ELSE COALESCE(gsl.seedling_type_id, 0) END AS seedling_type_id,
                   COALESCE(gsl.from_rootstock_type_id, gsl.rootstock_type_id, 0) AS rootstock_type_id,
-                  -COALESCE(gsl.variety_quantity, gsl.quantity)  AS qty_delta,
+                  -gsl.quantity                                   AS qty_delta,
                   NULL AS variety_name,
                   NULL AS seedling_type_name,
                   NULL AS rootstock_type_name
@@ -619,6 +784,100 @@ router.get(
     } catch (_) {
       return sendOk(res, []);
     }
+  })
+);
+
+// ─── POST /api/greenhouse/:locationId/stage-transfer ────────────────────────
+// Bir teplitsadagi bosqichdan boshqa teplitsaning bosqichiga ko'chatlarni o'tkazish
+router.post(
+  "/:locationId/stage-transfer",
+  authorize("admin", "bosh_agranom", "agranom"),
+  asyncHandler(async (req, res) => {
+    requireFields(req.body, ["toLocationId", "fromStage", "quantity"]);
+
+    const fromLocationId = toPositiveInt(req.params.locationId, "fromLocationId");
+    const toLocationId = toPositiveInt(req.body.toLocationId, "toLocationId");
+    const fromStage = req.body.fromStage;
+    const toStage = req.body.toStage || fromStage;
+    const quantity = toPositiveInt(req.body.quantity, "quantity");
+    const fromRootstockTypeId = req.body.fromRootstockTypeId != null ? Number(req.body.fromRootstockTypeId) : null;
+    const notes = req.body.notes || null;
+    const actionDate = req.body.actionDate ? new Date(req.body.actionDate) : new Date();
+
+    if (!GREENHOUSE_STAGES.includes(fromStage)) {
+      throw new AppError(`fromStage noto'g'ri: ${fromStage}`, 400);
+    }
+    if (!GREENHOUSE_STAGES.includes(toStage)) {
+      throw new AppError(`toStage noto'g'ri: ${toStage}`, 400);
+    }
+    if (fromLocationId === toLocationId) {
+      throw new AppError("Jo'natuvchi va qabul qiluvchi teplitsa bir xil bo'lmasligi kerak.", 400);
+    }
+
+    if (req.user.role === "agranom" && req.user.locationId !== fromLocationId) {
+      throw new AppError("Siz faqat o'z lokatsiyangizdan o'tkaza olasiz.", 403);
+    }
+
+    await ensureLogColumns(getPool());
+    await ensureGreenhouseTransfersTable(getPool());
+
+    const result = await withTransaction(async (conn) => {
+      const fromLocation = await fetchOne(
+        conn,
+        "SELECT id, name FROM locations WHERE id = ? LIMIT 1",
+        [fromLocationId]
+      );
+      if (!fromLocation) throw new AppError("Manba teplitsa topilmadi.", 404);
+
+      const toLocation = await fetchOne(
+        conn,
+        "SELECT id, name FROM locations WHERE id = ? LIMIT 1",
+        [toLocationId]
+      );
+      if (!toLocation) throw new AppError("Maqsad teplitsa topilmadi.", 404);
+
+      const [stockRows] = await conn.query(
+        `SELECT quantity FROM greenhouse_stage_stock WHERE location_id = ? AND stage = ? LIMIT 1`,
+        [fromLocationId, fromStage]
+      );
+      const available = Number(stockRows[0]?.quantity || 0);
+      if (available < quantity) {
+        throw new AppError(
+          `${GREENHOUSE_STAGES.includes(fromStage) ? fromStage : fromStage} bosqichida yetarli miqdor yo'q. Mavjud: ${available}, kerak: ${quantity}.`,
+          400
+        );
+      }
+
+      const actionDateStr = actionDate.toISOString().slice(0, 10);
+      const transferNote = notes || `${fromLocation.name} dan ${toLocation.name} ga o'tkazildi`;
+
+      // Stok HOZIRCHA ko'chirilmaydi — faqat transfer yozuvi yaratiladi
+      // Bosh agronom tasdiqlashida manba teplitsadan chiqariladi
+      // Qabul qiluvchi tasdiqlashida maqsad teplitsaga qo'shiladi
+      const transferCode = `GT-${Date.now()}-${fromLocationId}`;
+      await conn.query(
+        `INSERT INTO greenhouse_transfers
+          (transfer_code, from_location_id, to_location_id, from_stage, to_stage, quantity,
+           rootstock_type_id, transfer_date, note, status, created_by,
+           sender_confirmed, sender_confirmed_by, sender_confirmed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_head', ?, 1, ?, NOW())`,
+        [transferCode, fromLocationId, toLocationId, fromStage, toStage, quantity,
+         fromRootstockTypeId || null, actionDateStr, transferNote, req.user.id, req.user.id]
+      );
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "greenhouse_stage_transfer_created",
+        entityType: "greenhouse",
+        entityId: fromLocationId,
+        description: `${fromLocation.name} (${fromStage}) → ${toLocation.name} (${toStage}), ${quantity} ta — tasdiqlash kutilmoqda`,
+        metadata: { fromLocationId, toLocationId, fromStage, toStage, quantity }
+      });
+
+      return { transferCode, status: "pending_head" };
+    });
+
+    return sendOk(res, result, "Transfer yaratildi. Bosh agronom tasdig'i kutilmoqda.");
   })
 );
 

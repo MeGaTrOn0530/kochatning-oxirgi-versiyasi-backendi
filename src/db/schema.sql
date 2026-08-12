@@ -540,7 +540,7 @@ CREATE TABLE IF NOT EXISTS greenhouse_stage_log (
   location_id INT NOT NULL,
   action_date DATE NOT NULL,
   from_stage VARCHAR(50) NULL,
-  to_stage VARCHAR(50) NOT NULL,
+  to_stage VARCHAR(50) NULL,
   quantity INT NOT NULL DEFAULT 0,
   notes TEXT NULL,
   image_paths LONGTEXT NULL,
