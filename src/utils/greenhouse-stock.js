@@ -112,16 +112,59 @@ export async function ensureGreenhouseTransfersColumns(db) {
 
 // Nav bo'yicha stokni yangilash — cassette/grafting uchun nav/tur avtomatik nolga tenglanadi
 // (bu ikki bosqich faqat rootstock bo'yicha kuzatiladi), shu bilan har bir chaqiruv nuqtasi xavfsiz bo'ladi.
+//
+// MUHIM: manfiy delta (ayirish) uchun, agar aniq buket (masalan foydalanuvchi nav tanlamagan
+// holatda "Aniqlanmagan" buket) yetarli bo'lmasa, oddiy GREATEST(0,...) bilan ortiqcha qism
+// jimgina yo'qolib ketardi — bu esa boshqa buketlarda (masalan haqiqiy nav tegida) "elg'or"
+// (hech qachon to'g'ri bo'lmagan) miqdor qolib ketishiga olib kelardi, chunki keyinchalik shu
+// yozuv bekor qilinsa, miqdor xuddi o'sha (asossiz) buketga qaytarib qo'shilardi. Shuning uchun
+// yetishmagan qism shu bosqichning "Aniqlanmagan" (0,0,0) buketidan qarz olinadi — shunda
+// SUM(variety_stock bir bosqich uchun) har doim greenhouse_stage_stock bilan mos qoladi.
 export async function adjustVarietyStock(conn, locationId, stage, varietyId, seedlingTypeId, rootstockTypeId, delta) {
   const { varietyId: vId, seedlingTypeId: stId, rootstockTypeId: rtId } =
     normalizeVarietyBucket(stage, varietyId, seedlingTypeId, rootstockTypeId);
-  await conn.query(
-    `INSERT INTO greenhouse_variety_stock
-      (location_id, stage, variety_id, seedling_type_id, rootstock_type_id, quantity)
-     VALUES (?, ?, ?, ?, ?, GREATEST(0, ?))
-     ON DUPLICATE KEY UPDATE quantity = GREATEST(0, quantity + ?)`,
-    [locationId, stage, vId, stId, rtId, delta, delta]
+
+  if (delta >= 0) {
+    await conn.query(
+      `INSERT INTO greenhouse_variety_stock
+        (location_id, stage, variety_id, seedling_type_id, rootstock_type_id, quantity)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE quantity = quantity + ?`,
+      [locationId, stage, vId, stId, rtId, delta, delta]
+    );
+    return;
+  }
+
+  const need = -delta;
+  const isUnknownBucket = vId === 0 && stId === 0 && rtId === 0;
+
+  const [[row]] = await conn.query(
+    `SELECT quantity FROM greenhouse_variety_stock
+     WHERE location_id = ? AND stage = ? AND variety_id = ? AND seedling_type_id = ? AND rootstock_type_id = ?
+     FOR UPDATE`,
+    [locationId, stage, vId, stId, rtId]
   );
+  const available = Number(row?.quantity || 0);
+  const take = Math.min(need, available);
+
+  if (take > 0) {
+    await conn.query(
+      `UPDATE greenhouse_variety_stock SET quantity = quantity - ?
+       WHERE location_id = ? AND stage = ? AND variety_id = ? AND seedling_type_id = ? AND rootstock_type_id = ?`,
+      [take, locationId, stage, vId, stId, rtId]
+    );
+  }
+
+  const shortfall = need - take;
+  if (shortfall > 0 && !isUnknownBucket) {
+    await conn.query(
+      `INSERT INTO greenhouse_variety_stock
+        (location_id, stage, variety_id, seedling_type_id, rootstock_type_id, quantity)
+       VALUES (?, ?, 0, 0, 0, 0)
+       ON DUPLICATE KEY UPDATE quantity = GREATEST(0, quantity - ?)`,
+      [locationId, stage, shortfall]
+    );
+  }
 }
 
 // Sotuvda ishlatiladi: orders variety_id+seedling_type_id ni biladi, lekin rootstock_type_id ni
