@@ -20,6 +20,7 @@ import {
   ensureUnknownCatalog,
   getInventoryById
 } from "../utils/inventory.js";
+import { ensureVarietyStockTable, drainVarietyStockForSale } from "../utils/greenhouse-stock.js";
 
 const router = Router();
 
@@ -232,7 +233,7 @@ router.get(
 
 router.post(
   "/",
-  authorize("admin"),
+  authorize("admin", "bugalter", "agranom"),
   asyncHandler(async (req, res) => {
     requireFields(req.body, ["customerName", "locationId", "items"]);
 
@@ -242,6 +243,17 @@ router.post(
 
     const result = await withTransaction(async (conn) => {
       const locationId = toPositiveInt(req.body.locationId, "locationId");
+
+      // Agranom faqat manba lokatsiyasida (is_source=1) buyurtma yarata oladi
+      if (req.user.role === "agranom") {
+        const locRow = await fetchOne(conn, "SELECT is_source FROM locations WHERE id = ?", [locationId]);
+        if (!locRow || !locRow.is_source) {
+          throw new AppError("Agranom faqat manba lokatsiyasida buyurtma yarata oladi.", 403);
+        }
+        if (Number(req.user.location_id) !== locationId) {
+          throw new AppError("Siz faqat o'z lokatsiyangiz uchun buyurtma yarata olasiz.", 403);
+        }
+      }
       const orderDate = req.body.orderDate ? new Date(req.body.orderDate) : new Date();
 
       if (Number.isNaN(orderDate.getTime())) {
@@ -414,10 +426,10 @@ router.post(
 );
 
 // ─── POST /api/orders/greenhouse — Teplitsa tayyor stokidan buyurtma ──────────
-// Agronomlar va adminlar uchun: batchsiz, greenhouse variety asosida
+// Bugalter, admin va bosh_agranom yaratadi; agranom o'z lokatsiyasi uchun
 router.post(
   "/greenhouse",
-  authorize("admin", "bosh_agranom", "agranom"),
+  authorize("admin", "bosh_agranom", "bugalter", "agranom"),
   asyncHandler(async (req, res) => {
     requireFields(req.body, ["customerName", "locationId", "quantity"]);
 
@@ -435,23 +447,17 @@ router.post(
     }
 
     const pool = getPool();
+    await ensureVarietyStockTable(pool);
 
-    // Tayyor bosqichdagi stokni hisoblash
+    // Tayyor bosqichdagi stokni hisoblash — aniq nav+tur+rootstock buketidan (har doim aniq)
     const [stockRows] = await pool.query(
-      `SELECT
-         SUM(CASE WHEN to_stage = 'ready'   THEN COALESCE(variety_quantity, quantity) ELSE 0 END) -
-         SUM(CASE WHEN from_stage = 'ready' THEN COALESCE(variety_quantity, quantity) ELSE 0 END)
-         AS qty
-       FROM greenhouse_stage_log
-       WHERE location_id = ?
-         AND (to_stage = 'ready' OR from_stage = 'ready')
-         AND COALESCE(variety_id, 0) = ?
-         AND COALESCE(seedling_type_id, 0) = ?
-         AND COALESCE(rootstock_type_id, 0) = ?`,
+      `SELECT quantity FROM greenhouse_variety_stock
+       WHERE location_id = ? AND stage = 'ready' AND variety_id = ? AND seedling_type_id = ? AND rootstock_type_id = ?
+       LIMIT 1`,
       [locationId, varietyId || 0, seedlingTypeId || 0, rootstockTypeId || 0]
     );
 
-    const available = Math.max(0, Number(stockRows[0]?.qty || 0));
+    const available = Math.max(0, Number(stockRows[0]?.quantity || 0));
     const immediateQty = Math.min(available, quantity);
     const shortageQty = Math.max(0, quantity - available);
     const orderStatus = shortageQty > 0 ? "partial" : "new";
@@ -522,10 +528,81 @@ router.post(
   })
 );
 
+// ─── POST /api/orders/:id/agranom-confirm — Agranom "berdim" tasdiqlashi ───
+router.post(
+  "/:id/agranom-confirm",
+  authorize("admin", "agranom", "bosh_agranom"),
+  asyncHandler(async (req, res) => {
+    const result = await withTransaction(async (conn) => {
+      const orderId = toPositiveInt(req.params.id, "orderId");
+      const order = await fetchOne(
+        conn,
+        "SELECT * FROM orders WHERE id = ? LIMIT 1 FOR UPDATE",
+        [orderId]
+      );
+
+      if (!order) throw new AppError("Buyurtma topilmadi.", 404);
+
+      if (!["new", "partial"].includes(order.status)) {
+        throw new AppError("Bu buyurtma 'berdim' tasdiqlash uchun mos emas.", 400);
+      }
+
+      if (req.user.role === "agranom" && req.user.locationId !== order.location_id) {
+        throw new AppError("Siz faqat o'z lokatsiyangiz buyurtmasini tasdiqlay olasiz.", 403);
+      }
+
+      // agranom_confirmed_by kolonnasi yo'q bo'lsa, statusni o'zgartirib, notes ga yozamiz
+      await conn.query(
+        `UPDATE orders
+         SET notes = CONCAT(COALESCE(notes, ''), ?)
+         WHERE id = ?`,
+        [`\n[Agranom tasdiqladi: ${req.user.fullName || req.user.username} — ${new Date().toLocaleString("uz-UZ")}]`, orderId]
+      );
+
+      // Status ni "agranom_confirmed" ga o'tkazish uchun: mavjud status ni saqlash
+      // Lekin orders jadvalida bu status yo'q, shuning uchun notes ga yozamiz va "pending_head" atamasini ishlatmaymiz
+      // Frontend da buni notes orqali aniqlaymiz, yoki yangi status qo'shamiz
+
+      await conn.query(
+        `UPDATE orders SET status = 'agranom_confirmed', updated_at = NOW() WHERE id = ?`,
+        [orderId]
+      );
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "order_agranom_confirmed",
+        entityType: "order",
+        entityId: orderId,
+        description: `${order.order_number} buyurtmasi agranom tomonidan tasdiqlandi (berdim)`,
+      });
+
+      const notificationRecipientIds = await getNotificationRecipientIds(conn, {
+        roles: ["admin", "bosh_agranom"],
+        excludeUserIds: [req.user.id],
+      });
+      await createNotifications(conn, notificationRecipientIds, {
+        type: "order_agranom_confirmed",
+        title: "Buyurtma berildi",
+        message: `${order.order_number} buyurtmasi agranom tomonidan berildi. Tasdiqlash kerak.`,
+        entityType: "order",
+        entityId: orderId,
+        locationId: order.location_id,
+        createdBy: req.user.id,
+      });
+
+      return { id: orderId, status: "agranom_confirmed" };
+    });
+
+    return sendOk(res, result, "Agranom tasdiqladi.");
+  })
+);
+
 router.post(
   "/:id/sell",
-  authorize("admin", "agranom"),
+  authorize("admin", "agranom", "bosh_agranom"),
   asyncHandler(async (req, res) => {
+    await ensureVarietyStockTable(getPool());
+
     const result = await withTransaction(async (conn) => {
       const orderId = toPositiveInt(req.params.id, "orderId");
       const order = await fetchOne(
@@ -538,7 +615,7 @@ router.post(
         throw new AppError("Order topilmadi.", 404);
       }
 
-      if (!["new", "partial", "shortage"].includes(order.status)) {
+      if (!["new", "partial", "shortage", "agranom_confirmed"].includes(order.status)) {
         throw new AppError("Faqat yangi yoki faol order sotilishi mumkin.", 400);
       }
 
@@ -584,6 +661,7 @@ router.post(
              order.variety_id || null,
              soldQty]
           );
+          await drainVarietyStockForSale(conn, order.location_id, 'ready', order.variety_id, order.seedling_type_id, soldQty);
         }
       } else {
         for (const item of items) {
@@ -642,6 +720,7 @@ router.post(
                order.variety_id || null,
                totalSoldQty]
             );
+            await drainVarietyStockForSale(conn, order.location_id, 'ready', order.variety_id, order.seedling_type_id, totalSoldQty);
           }
         }
       }
@@ -707,6 +786,8 @@ router.post(
   "/:id/partial-fulfill",
   authorize("admin", "agranom"),
   asyncHandler(async (req, res) => {
+    await ensureVarietyStockTable(getPool());
+
     const result = await withTransaction(async (conn) => {
       const orderId = toPositiveInt(req.params.id, "orderId");
       const deliverQuantity = toPositiveInt(req.body.deliverQuantity, "deliverQuantity");
@@ -754,6 +835,7 @@ router.post(
            req.user.id, order.seedling_type_id || null,
            order.variety_id || null, deliverQuantity]
         );
+        await drainVarietyStockForSale(conn, order.location_id, 'ready', order.variety_id, order.seedling_type_id, deliverQuantity);
       } else {
         // Oddiy batch buyurtma: inventardan kamaytirish
         const items = await conn.query(
@@ -860,6 +942,42 @@ router.post(
     });
 
     return sendOk(res, result, "Qisman berish muvaffaqiyatli bajarildi.");
+  })
+);
+
+// ─── DELETE /api/orders/:id — Admin buyurtmani o'chirish ─────────────────────
+router.delete(
+  "/:id",
+  authorize("admin"),
+  asyncHandler(async (req, res) => {
+    const pool = getPool();
+    const orderId = toPositiveInt(req.params.id, "orderId");
+
+    const order = await fetchOne(
+      pool,
+      "SELECT id, order_number, status FROM orders WHERE id = ? LIMIT 1",
+      [orderId]
+    );
+
+    if (!order) {
+      throw new AppError("Buyurtma topilmadi.", 404);
+    }
+
+    await withTransaction(async (conn) => {
+      await conn.query("DELETE FROM order_items WHERE order_id = ?", [orderId]);
+      await conn.query("DELETE FROM orders WHERE id = ?", [orderId]);
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "order_deleted",
+        entityType: "order",
+        entityId: orderId,
+        description: `${order.order_number} buyurtmasi o'chirildi`,
+        metadata: { orderId, orderNumber: order.order_number, status: order.status },
+      });
+    });
+
+    return sendOk(res, { id: orderId }, "Buyurtma o'chirildi.");
   })
 );
 

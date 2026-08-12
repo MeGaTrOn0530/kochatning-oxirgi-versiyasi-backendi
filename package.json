@@ -10,7 +10,8 @@
     "db:init": "node src/scripts/init-db.js",
     "db:seed-catalog": "node src/scripts/seed-catalog.js",
     "db:reset": "node src/scripts/reset-db.js",
-    "db:seed-locations": "node src/scripts/seed-locations.js"
+    "db:seed-locations": "node src/scripts/seed-locations.js",
+    "db:reconcile-greenhouse-variety": "node src/scripts/reconcile-greenhouse-variety-stock.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
