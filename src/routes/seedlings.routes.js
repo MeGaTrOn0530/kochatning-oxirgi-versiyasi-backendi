@@ -279,7 +279,7 @@ router.get(
               last_history.last_history_id, last_history.created_by AS last_history_created_by,
               last_history.approved_by, last_history.approval_status, last_history.image_paths, last_history.stage_date,
               receive_history.stage_date AS received_at_exact, receive_history.next_stage AS received_stage,
-              gss_ready.greenhouse_ready_qty
+              gss_ready.quantity AS greenhouse_ready_qty
        FROM seedling_inventory si
        JOIN seedling_batches b ON b.id = si.batch_id
        LEFT JOIN seedling_types st ON st.id = b.seedling_type_id
@@ -307,13 +307,12 @@ router.get(
            GROUP BY batch_id
          ) earliest ON earliest.first_history_id = h.id
        ) receive_history ON receive_history.batch_id = si.batch_id
-       LEFT JOIN (
-         SELECT gss.location_id, SUM(gss.quantity) AS greenhouse_ready_qty
-         FROM greenhouse_stage_stock gss
-         INNER JOIN locations loc_gh ON loc_gh.id = gss.location_id AND loc_gh.type = 'greenhouse'
-         WHERE gss.stage = 'ready'
-         GROUP BY gss.location_id
-       ) gss_ready ON gss_ready.location_id = si.location_id
+       LEFT JOIN greenhouse_variety_stock gss_ready
+         ON gss_ready.location_id = si.location_id
+         AND gss_ready.stage = 'ready'
+         AND gss_ready.variety_id = COALESCE(b.variety_id, 0)
+         AND gss_ready.seedling_type_id = COALESCE(b.seedling_type_id, 0)
+         AND gss_ready.rootstock_type_id = COALESCE(b.rootstock_type_id, 0)
        WHERE ${conditions.join(" AND ")}
        ORDER BY si.updated_at DESC, si.id DESC`,
       params
