@@ -463,6 +463,32 @@ router.post(
         );
       }
 
+      // Agar foydalanuvchi aniq nav/payvand turini tanlagan bo'lsa, umumiy bosqich
+      // jamisi yetarli bo'lsa ham, AYNAN shu birikmada yetarli borligini alohida tekshiramiz —
+      // aks holda umumiy sondan to'g'ri ayiriladi-yu, lekin aniq buket "manfiy"ga kirib,
+      // 0 da qolib, farq boshqa hech qayerda ko'rinmay yo'qolib ketadi (nav-taqsimot xato bo'lib qoladi).
+      const fromBucketVarietyId = fromStageIsRootstockOnly ? 0 : (varietyId || 0);
+      const fromBucketSeedlingTypeId = fromStageIsRootstockOnly ? 0 : (seedlingTypeId || 0);
+      const fromBucketRootstockId = effectiveRootstockTypeId || 0;
+      const fromBucketIsSpecific =
+        fromBucketVarietyId !== 0 || fromBucketSeedlingTypeId !== 0 || fromBucketRootstockId !== 0;
+
+      if (fromBucketIsSpecific) {
+        const [bucketRows] = await conn.query(
+          `SELECT quantity FROM greenhouse_variety_stock
+           WHERE location_id = ? AND stage = ? AND variety_id = ? AND seedling_type_id = ? AND rootstock_type_id = ?
+           LIMIT 1`,
+          [locationId, fromStage, fromBucketVarietyId, fromBucketSeedlingTypeId, fromBucketRootstockId]
+        );
+        const bucketAvailable = Number(bucketRows[0]?.quantity || 0);
+        if (bucketAvailable < needed) {
+          throw new AppError(
+            `Tanlangan nav/payvand turida yetarli miqdor yo'q. Mavjud: ${bucketAvailable}, kerak: ${needed}.`,
+            400
+          );
+        }
+      }
+
       const actionDateStr = actionDate.toISOString().slice(0, 10);
 
       // Asosiy harakat: fromStage → toStage
@@ -677,6 +703,7 @@ router.post(
     await ensureLogColumns(getPool());
     await ensureGreenhouseTransfersTable(getPool());
     await ensureGreenhouseTransfersColumns(getPool());
+    await ensureVarietyStockTable(getPool());
 
     const result = await withTransaction(async (conn) => {
       const fromLocation = await fetchOne(
@@ -703,6 +730,30 @@ router.post(
           `${GREENHOUSE_STAGES.includes(fromStage) ? fromStage : fromStage} bosqichida yetarli miqdor yo'q. Mavjud: ${available}, kerak: ${quantity}.`,
           400
         );
+      }
+
+      // Aniq nav/payvand turi tanlangan bo'lsa, umumiy bosqich jamisidan tashqari
+      // AYNAN shu birikmada ham yetarli borligini tekshiramiz (aks holda nav-taqsimot chalkashadi).
+      const fromBucketVarietyId = varietyId || 0;
+      const fromBucketSeedlingTypeId = seedlingTypeId || 0;
+      const fromBucketRootstockId = fromRootstockTypeId || 0;
+      const fromBucketIsSpecific =
+        fromBucketVarietyId !== 0 || fromBucketSeedlingTypeId !== 0 || fromBucketRootstockId !== 0;
+
+      if (fromBucketIsSpecific) {
+        const [bucketRows] = await conn.query(
+          `SELECT quantity FROM greenhouse_variety_stock
+           WHERE location_id = ? AND stage = ? AND variety_id = ? AND seedling_type_id = ? AND rootstock_type_id = ?
+           LIMIT 1`,
+          [fromLocationId, fromStage, fromBucketVarietyId, fromBucketSeedlingTypeId, fromBucketRootstockId]
+        );
+        const bucketAvailable = Number(bucketRows[0]?.quantity || 0);
+        if (bucketAvailable < quantity) {
+          throw new AppError(
+            `Tanlangan nav/payvand turida yetarli miqdor yo'q. Mavjud: ${bucketAvailable}, kerak: ${quantity}.`,
+            400
+          );
+        }
       }
 
       const actionDateStr = actionDate.toISOString().slice(0, 10);
