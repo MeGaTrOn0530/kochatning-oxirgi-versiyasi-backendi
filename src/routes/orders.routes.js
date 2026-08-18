@@ -26,6 +26,20 @@ const router = Router();
 
 router.use(authenticate);
 
+// "record_type" — 'order' (sotuv) yoki 'reminder' (eslatma, hech qanday stock ta'sir qilmaydi).
+// Eski qatorlar uchun standart 'order' — mavjud xulq-atvorga ta'sir qilmaydi.
+async function ensureOrderColumns(db) {
+  const [cols] = await db.query(
+    `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders' AND COLUMN_NAME = 'record_type'`
+  );
+  if (cols.length === 0) {
+    await db.query(
+      `ALTER TABLE orders ADD COLUMN record_type VARCHAR(20) NOT NULL DEFAULT 'order'`
+    );
+  }
+}
+
 async function resolveExistingId(conn, tableName, id) {
   if (!id) return null;
   const row = await fetchOne(conn, `SELECT id FROM ${tableName} WHERE id = ? LIMIT 1`, [id]);
@@ -146,6 +160,7 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const pool = getPool();
+    await ensureOrderColumns(pool);
     const conditions = ["1 = 1"];
     const params = [];
 
@@ -176,12 +191,15 @@ router.get(
 
     const [rows] = await pool.query(
       `SELECT o.*, l.name AS location_name, cu.full_name AS created_by_name, su.full_name AS sold_by_name,
+              ov.name AS variety_name, ost.name AS seedling_type_name,
               COUNT(DISTINCT oi.id) AS items_count,
               GROUP_CONCAT(DISTINCT b.batch_code ORDER BY b.batch_code SEPARATOR ', ') AS batch_codes
        FROM orders o
        JOIN locations l ON l.id = o.location_id
        LEFT JOIN users cu ON cu.id = o.created_by
        LEFT JOIN users su ON su.id = o.sold_by
+       LEFT JOIN varieties ov ON ov.id = o.variety_id
+       LEFT JOIN seedling_types ost ON ost.id = o.seedling_type_id
        LEFT JOIN order_items oi ON oi.order_id = o.id
        LEFT JOIN seedling_batches b ON b.id = oi.batch_id
        WHERE ${conditions.join(" AND ")}
@@ -198,15 +216,19 @@ router.get(
   "/:id",
   asyncHandler(async (req, res) => {
     const pool = getPool();
+    await ensureOrderColumns(pool);
     const orderId = toPositiveInt(req.params.id, "orderId");
 
     const order = await fetchOne(
       pool,
-      `SELECT o.*, l.name AS location_name, cu.full_name AS created_by_name, su.full_name AS sold_by_name
+      `SELECT o.*, l.name AS location_name, cu.full_name AS created_by_name, su.full_name AS sold_by_name,
+              ov.name AS variety_name, ost.name AS seedling_type_name
        FROM orders o
        JOIN locations l ON l.id = o.location_id
        LEFT JOIN users cu ON cu.id = o.created_by
        LEFT JOIN users su ON su.id = o.sold_by
+       LEFT JOIN varieties ov ON ov.id = o.variety_id
+       LEFT JOIN seedling_types ost ON ost.id = o.seedling_type_id
        WHERE o.id = ?
        LIMIT 1`,
       [orderId]
@@ -528,11 +550,149 @@ router.post(
   })
 );
 
+// ─── POST /api/orders/reminder — Eslatma (kelajakda tayyor bo'ladigan miqdor) ─
+// Hech qanday stock tekshiruvi yoki o'zgarishi yo'q — faqat qayd. "Sotuvga aylantirish"
+// orqali keyinchalik haqiqiy buyurtmaga aylanadi (o'shanda mavjudlik tekshiriladi).
+router.post(
+  "/reminder",
+  authorize("admin", "bosh_agranom", "bugalter", "agranom"),
+  asyncHandler(async (req, res) => {
+    requireFields(req.body, ["customerName", "locationId", "quantity"]);
+
+    const locationId = toPositiveInt(req.body.locationId, "locationId");
+    const quantity = toPositiveInt(req.body.quantity, "quantity");
+    const varietyId = req.body.varietyId ? Number(req.body.varietyId) : null;
+    const seedlingTypeId = req.body.seedlingTypeId ? Number(req.body.seedlingTypeId) : null;
+    const unitPrice = toNumber(req.body.unitPrice || 0, "unitPrice", 0);
+    const orderDate = req.body.orderDate ? new Date(req.body.orderDate) : new Date();
+    const expectedDate = req.body.expectedDate ? new Date(req.body.expectedDate) : null;
+
+    if (req.user.role === "agranom" && req.user.locationId !== locationId) {
+      throw new AppError("Siz faqat o'z lokatsiyangiz uchun eslatma yarata olasiz.", 403);
+    }
+
+    const pool = getPool();
+    await ensureOrderColumns(pool);
+
+    const totalAmount = quantity * unitPrice;
+    const orderNumber = req.body.orderNumber || generateCode("REM");
+
+    const result = await withTransaction(async (conn) => {
+      await ensureLocationExists(conn, locationId);
+
+      const [orderResult] = await conn.query(
+        `INSERT INTO orders
+          (order_number, client_name, customer_name, customer_phone, location_id, status, record_type,
+           order_date, note, notes, total_amount, total_quantity, quantity, fulfilled_quantity,
+           shortage_quantity, expected_date, batch_id, seedling_type_id, variety_id, created_by)
+         VALUES (?, ?, ?, ?, ?, 'new', 'reminder', ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?)`,
+        [
+          orderNumber,
+          req.body.customerName,
+          req.body.customerName,
+          req.body.customerPhone || null,
+          locationId,
+          orderDate,
+          req.body.notes || null,
+          req.body.notes || null,
+          totalAmount,
+          quantity,
+          quantity,
+          expectedDate,
+          seedlingTypeId,
+          varietyId,
+          req.user.id,
+        ]
+      );
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "order_reminder_created",
+        entityType: "order",
+        entityId: orderResult.insertId,
+        description: `${orderNumber} eslatma yaratildi`,
+        metadata: { locationId, quantity, expectedDate }
+      });
+
+      return { orderId: orderResult.insertId, orderNumber };
+    });
+
+    return sendCreated(res, result, "Eslatma saqlandi.");
+  })
+);
+
+// ─── POST /api/orders/:id/convert-to-sale — Eslatmani haqiqiy sotuvga aylantirish ─
+// Hozirgi mavjudlikni tekshiradi (greenhouse_variety_stock bo'yicha, nav+tur kesimida,
+// barcha payvand buketlari + Aniqlanmagan jamlanib) va yetarli/qisman holatga o'tkazadi.
+router.post(
+  "/:id/convert-to-sale",
+  authorize("admin", "bosh_agranom", "bugalter", "agranom"),
+  asyncHandler(async (req, res) => {
+    const orderId = toPositiveInt(req.params.id, "orderId");
+    const pool = getPool();
+    await ensureOrderColumns(pool);
+    await ensureVarietyStockTable(pool);
+
+    const result = await withTransaction(async (conn) => {
+      const order = await fetchOne(
+        conn,
+        "SELECT * FROM orders WHERE id = ? LIMIT 1 FOR UPDATE",
+        [orderId]
+      );
+      if (!order) throw new AppError("Buyurtma topilmadi.", 404);
+      if (order.record_type !== "reminder") {
+        throw new AppError("Bu allaqachon haqiqiy buyurtma, eslatma emas.", 400);
+      }
+      if (req.user.role === "agranom" && req.user.locationId !== order.location_id) {
+        throw new AppError("Siz faqat o'z lokatsiyangiz eslatmasini sotuvga aylantira olasiz.", 403);
+      }
+
+      const [[availRow]] = await conn.query(
+        `SELECT COALESCE(SUM(quantity), 0) AS avail FROM greenhouse_variety_stock
+         WHERE location_id = ? AND stage = 'ready'
+           AND ((variety_id = ? AND seedling_type_id = ?) OR (variety_id = 0 AND seedling_type_id = 0))`,
+        [order.location_id, order.variety_id || 0, order.seedling_type_id || 0]
+      );
+      const available = Number(availRow.avail || 0);
+      const quantity = Number(order.total_quantity || 0);
+      const immediateQty = Math.min(available, quantity);
+      const shortageQty = Math.max(0, quantity - available);
+      const newStatus = shortageQty > 0 ? "partial" : "new";
+
+      await conn.query(
+        `UPDATE orders
+         SET record_type = 'order', status = ?, shortage_quantity = ?, fulfilled_quantity = 0, order_date = NOW()
+         WHERE id = ?`,
+        [newStatus, shortageQty, orderId]
+      );
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "order_reminder_converted",
+        entityType: "order",
+        entityId: orderId,
+        description: `${order.order_number} eslatmadan sotuvga aylantirildi`,
+        metadata: { available, quantity, immediateQty, shortageQty }
+      });
+
+      return {
+        orderId,
+        status: newStatus,
+        immediateQuantity: immediateQty,
+        shortageQuantity: shortageQty,
+      };
+    });
+
+    return sendOk(res, result, "Eslatma sotuvga aylantirildi.");
+  })
+);
+
 // ─── POST /api/orders/:id/agranom-confirm — Agranom "berdim" tasdiqlashi ───
 router.post(
   "/:id/agranom-confirm",
   authorize("admin", "agranom", "bosh_agranom"),
   asyncHandler(async (req, res) => {
+    await ensureOrderColumns(getPool());
     const result = await withTransaction(async (conn) => {
       const orderId = toPositiveInt(req.params.id, "orderId");
       const order = await fetchOne(
@@ -542,6 +702,9 @@ router.post(
       );
 
       if (!order) throw new AppError("Buyurtma topilmadi.", 404);
+      if (order.record_type === "reminder") {
+        throw new AppError("Bu — eslatma, hali haqiqiy buyurtma emas. Avval sotuvga aylantiring.", 400);
+      }
 
       if (!["new", "partial"].includes(order.status)) {
         throw new AppError("Bu buyurtma 'berdim' tasdiqlash uchun mos emas.", 400);
@@ -602,6 +765,7 @@ router.post(
   authorize("admin", "agranom", "bosh_agranom"),
   asyncHandler(async (req, res) => {
     await ensureVarietyStockTable(getPool());
+    await ensureOrderColumns(getPool());
 
     const result = await withTransaction(async (conn) => {
       const orderId = toPositiveInt(req.params.id, "orderId");
@@ -613,6 +777,9 @@ router.post(
 
       if (!order) {
         throw new AppError("Order topilmadi.", 404);
+      }
+      if (order.record_type === "reminder") {
+        throw new AppError("Bu — eslatma, hali haqiqiy buyurtma emas. Avval sotuvga aylantiring.", 400);
       }
 
       if (!["new", "partial", "shortage", "agranom_confirmed"].includes(order.status)) {
@@ -789,6 +956,7 @@ router.post(
   authorize("admin", "agranom"),
   asyncHandler(async (req, res) => {
     await ensureVarietyStockTable(getPool());
+    await ensureOrderColumns(getPool());
 
     const result = await withTransaction(async (conn) => {
       const orderId = toPositiveInt(req.params.id, "orderId");
@@ -802,6 +970,9 @@ router.post(
       );
 
       if (!order) throw new AppError("Buyurtma topilmadi.", 404);
+      if (order.record_type === "reminder") {
+        throw new AppError("Bu — eslatma, hali haqiqiy buyurtma emas. Avval sotuvga aylantiring.", 400);
+      }
       if (["completed", "cancelled"].includes(order.status)) {
         throw new AppError("Bu buyurtma allaqachon yakunlangan yoki bekor qilingan.", 400);
       }
