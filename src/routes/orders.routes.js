@@ -597,12 +597,17 @@ router.post(
       const immediateQty = Math.min(available, quantity);
       const shortageQty = Math.max(0, quantity - available);
       const newStatus = shortageQty > 0 ? "partial" : "new";
+      // fulfilled_quantity boshida 0, shuning uchun shortage_quantity ham "hali berilmagan"
+      // butun miqdorga (quantity) teng bo'lishi kerak — aks holda fulfilled+shortage=total
+      // invarianti buziladi va keyingi "Qisman berish"lar hisobi noto'g'ri chiqadi (masalan,
+      // hozir mavjud qism "yo'qolib qoladi" — na berilgan, na bron sifatida ko'rinadi).
+      const initialShortage = newStatus === "partial" ? quantity : shortageQty;
 
       await conn.query(
         `UPDATE orders
          SET record_type = 'order', status = ?, shortage_quantity = ?, fulfilled_quantity = 0, order_date = NOW()
          WHERE id = ?`,
-        [newStatus, shortageQty, orderId]
+        [newStatus, initialShortage, orderId]
       );
 
       await logActivity(conn, {
