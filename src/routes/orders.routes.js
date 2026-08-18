@@ -20,7 +20,7 @@ import {
   ensureUnknownCatalog,
   getInventoryById
 } from "../utils/inventory.js";
-import { ensureVarietyStockTable, drainVarietyStockForSale } from "../utils/greenhouse-stock.js";
+import { ensureVarietyStockTable, drainVarietyStockForSale, assertVarietyStockAvailable } from "../utils/greenhouse-stock.js";
 
 const router = Router();
 
@@ -643,6 +643,7 @@ router.post(
         // Greenhouse buyurtma — tayyor bosqich stokini kamaytirish
         const soldQty = (order.total_quantity || 0) - (order.shortage_quantity || 0);
         if (soldQty > 0) {
+          await assertVarietyStockAvailable(conn, order.location_id, 'ready', order.variety_id, order.seedling_type_id, soldQty);
           await conn.query(
             `UPDATE greenhouse_stage_stock
              SET quantity = GREATEST(0, quantity - ?)
@@ -702,6 +703,7 @@ router.post(
         if (locRow[0]?.type === 'greenhouse' && !locRow[0]?.is_source) {
           const totalSoldQty = items.reduce((s, i) => s + Number(i.quantity || 0), 0);
           if (totalSoldQty > 0) {
+            await assertVarietyStockAvailable(conn, order.location_id, 'ready', order.variety_id, order.seedling_type_id, totalSoldQty);
             await conn.query(
               `UPDATE greenhouse_stage_stock
                SET quantity = GREATEST(0, quantity - ?)
@@ -819,6 +821,7 @@ router.post(
 
       if (isGreenhouseOrder) {
         // Greenhouse buyurtma: tayyor bosqich stokini bevosita kamaytirish
+        await assertVarietyStockAvailable(conn, order.location_id, 'ready', order.variety_id, order.seedling_type_id, deliverQuantity);
         await conn.query(
           `UPDATE greenhouse_stage_stock
            SET quantity = GREATEST(0, quantity - ?)

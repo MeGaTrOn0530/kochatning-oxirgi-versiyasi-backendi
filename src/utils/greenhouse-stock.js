@@ -3,6 +3,8 @@
 // shunda "har bosqich o'zgarishida ikkala jadval (stage_stock va variety_stock) birga yangilanadi" qoidasi
 // bitta joyda ta'minlanadi.
 
+import AppError from "./app-error.js";
+
 export const GREENHOUSE_STAGES = ["cassette", "grafting", "grafted", "ready"];
 
 // cassette/grafting: FAQAT rootstock (payvand turi) bo'yicha kuzatiladi, nav/tur ahamiyatsiz.
@@ -197,6 +199,30 @@ export async function drainVarietyStockForSale(conn, locationId, stage, varietyI
       conn, locationId, stage,
       UNKNOWN_VARIETY_BUCKET.varietyId, UNKNOWN_VARIETY_BUCKET.seedlingTypeId, UNKNOWN_VARIETY_BUCKET.rootstockTypeId,
       -remaining
+    );
+  }
+}
+
+// Sotuvdan oldin tekshirish: tanlangan nav+tur bo'yicha (barcha rootstock buketlari +
+// "Aniqlanmagan" buket jamlanib) yetarli miqdor bormi. Yetarli bo'lmasa rad etadi —
+// aks holda drainVarietyStockForSale yetishmagan qismni jimgina yo'qotib qo'yar edi,
+// natijada bosqich jamisi kamayadi-yu, nav-taqsimot yig'indisi ortiqcha qolib ketardi.
+export async function assertVarietyStockAvailable(conn, locationId, stage, varietyId, seedlingTypeId, quantity) {
+  if (!(quantity > 0)) return;
+  const vId = varietyId || 0;
+  const stId = seedlingTypeId || 0;
+
+  const [[row]] = await conn.query(
+    `SELECT COALESCE(SUM(quantity), 0) AS avail FROM greenhouse_variety_stock
+     WHERE location_id = ? AND stage = ?
+       AND ((variety_id = ? AND seedling_type_id = ?) OR (variety_id = 0 AND seedling_type_id = 0))`,
+    [locationId, stage, vId, stId]
+  );
+  const avail = Number(row?.avail || 0);
+  if (avail < quantity) {
+    throw new AppError(
+      `Tanlangan nav/tur bo'yicha yetarli miqdor yo'q. Mavjud: ${avail}, kerak: ${quantity}.`,
+      400
     );
   }
 }
