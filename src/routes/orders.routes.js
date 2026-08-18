@@ -29,12 +29,13 @@ router.use(authenticate);
 // "record_type" — 'order' (sotuv, mavjudlik tekshirilgan/tasdiqlangan) yoki
 // 'reminder' (endigina yaratilgan buyurtma — hali stock ta'sir qilmagan, faqat qayd).
 // "payment_status" — to'lov holati: 'unpaid' | 'partial' | 'paid'.
-// Eski qatorlar uchun standart 'order'/'unpaid' — mavjud xulq-atvorga ta'sir qilmaydi.
+// "paid_amount" — haqiqatda to'langan summa (so'm).
+// Eski qatorlar uchun standart 'order'/'unpaid'/0 — mavjud xulq-atvorga ta'sir qilmaydi.
 async function ensureOrderColumns(db) {
   const [cols] = await db.query(
     `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'orders'
-     AND COLUMN_NAME IN ('record_type', 'payment_status')`
+     AND COLUMN_NAME IN ('record_type', 'payment_status', 'paid_amount')`
   );
   const existing = cols.map((c) => c.COLUMN_NAME);
   const alters = [];
@@ -42,6 +43,8 @@ async function ensureOrderColumns(db) {
     alters.push("ADD COLUMN record_type VARCHAR(20) NOT NULL DEFAULT 'order'");
   if (!existing.includes("payment_status"))
     alters.push("ADD COLUMN payment_status VARCHAR(20) NOT NULL DEFAULT 'unpaid'");
+  if (!existing.includes("paid_amount"))
+    alters.push("ADD COLUMN paid_amount DECIMAL(14,2) NOT NULL DEFAULT 0");
   if (alters.length > 0) {
     await db.query(`ALTER TABLE orders ${alters.join(", ")}`);
   }
@@ -469,6 +472,7 @@ router.post(
     const rootstockTypeId = req.body.rootstockTypeId ? Number(req.body.rootstockTypeId) : null;
     const unitPrice = toNumber(req.body.unitPrice || 0, "unitPrice", 0);
     const paymentStatus = ["unpaid", "partial", "paid"].includes(req.body.paymentStatus) ? req.body.paymentStatus : "unpaid";
+    const paidAmount = paymentStatus === "unpaid" ? 0 : toNumber(req.body.paidAmount || 0, "paidAmount", 0);
     const orderDate = req.body.orderDate ? new Date(req.body.orderDate) : new Date();
     const expectedDate = req.body.expectedDate ? new Date(req.body.expectedDate) : null;
 
@@ -500,9 +504,9 @@ router.post(
       const [orderResult] = await conn.query(
         `INSERT INTO orders
           (order_number, client_name, customer_name, customer_phone, location_id, status, record_type,
-           payment_status, order_date, note, notes, total_amount, total_quantity, quantity,
+           payment_status, paid_amount, order_date, note, notes, total_amount, total_quantity, quantity,
            fulfilled_quantity, shortage_quantity, expected_date, batch_id, seedling_type_id, variety_id, created_by)
-         VALUES (?, ?, ?, ?, ?, 'new', 'reminder', ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, 'new', 'reminder', ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NULL, ?, ?, ?)`,
         [
           orderNumber,
           req.body.customerName,
@@ -510,6 +514,7 @@ router.post(
           req.body.customerPhone || null,
           locationId,
           paymentStatus,
+          paidAmount,
           orderDate,
           req.body.notes || null,
           req.body.notes || null,
@@ -631,6 +636,7 @@ router.post(
     if (!["unpaid", "partial", "paid"].includes(paymentStatus)) {
       throw new AppError("paymentStatus noto'g'ri.", 400);
     }
+    const paidAmount = paymentStatus === "unpaid" ? 0 : toNumber(req.body.paidAmount || 0, "paidAmount", 0);
 
     const pool = getPool();
     await ensureOrderColumns(pool);
@@ -641,8 +647,11 @@ router.post(
       throw new AppError("Siz faqat o'z lokatsiyangiz buyurtmasini o'zgartira olasiz.", 403);
     }
 
-    await pool.query("UPDATE orders SET payment_status = ? WHERE id = ?", [paymentStatus, orderId]);
-    return sendOk(res, { orderId, paymentStatus }, "To'lov holati yangilandi.");
+    await pool.query(
+      "UPDATE orders SET payment_status = ?, paid_amount = ? WHERE id = ?",
+      [paymentStatus, paidAmount, orderId]
+    );
+    return sendOk(res, { orderId, paymentStatus, paidAmount }, "To'lov holati yangilandi.");
   })
 );
 
