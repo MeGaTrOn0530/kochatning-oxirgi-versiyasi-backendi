@@ -95,6 +95,29 @@ export async function ensureGreenhouseTransfersTable(db) {
   `);
 }
 
+// Ko'p-navli to'g'ridan-to'g'ri savdo (Savdo sahifasidagi "Yangi savdo") uchun
+// har bir qatorni alohida saqlaydi — order_items dan farqli, bu yerda batch_id/inventory_id
+// shart emas (partiyasiz, faqat nav+tur bo'yicha savdo qilinadi).
+export async function ensureGreenhouseOrderItemsTable(db) {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS greenhouse_order_items (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      order_id INT NOT NULL,
+      variety_id INT NOT NULL DEFAULT 0,
+      seedling_type_id INT NOT NULL DEFAULT 0,
+      rootstock_type_id INT NOT NULL DEFAULT 0,
+      quantity INT NOT NULL,
+      unit_price DECIMAL(14,2) NOT NULL DEFAULT 0,
+      total_price DECIMAL(14,2) NOT NULL DEFAULT 0,
+      fulfilled_quantity INT NOT NULL DEFAULT 0,
+      shortage_quantity INT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+      INDEX idx_gh_order_items_order (order_id)
+    )
+  `);
+}
+
 export async function ensureGreenhouseTransfersColumns(db) {
   const [cols] = await db.query(
     `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS

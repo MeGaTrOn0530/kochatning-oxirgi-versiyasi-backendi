@@ -20,7 +20,12 @@ import {
   ensureUnknownCatalog,
   getInventoryById
 } from "../utils/inventory.js";
-import { ensureVarietyStockTable, drainVarietyStockForSale, assertVarietyStockAvailable } from "../utils/greenhouse-stock.js";
+import {
+  ensureVarietyStockTable,
+  drainVarietyStockForSale,
+  assertVarietyStockAvailable,
+  ensureGreenhouseOrderItemsTable,
+} from "../utils/greenhouse-stock.js";
 
 const router = Router();
 
@@ -171,6 +176,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const pool = getPool();
     await ensureOrderColumns(pool);
+    await ensureGreenhouseOrderItemsTable(pool);
     const conditions = ["1 = 1"];
     const params = [];
 
@@ -203,7 +209,9 @@ router.get(
       `SELECT o.*, l.name AS location_name, cu.full_name AS created_by_name, su.full_name AS sold_by_name,
               ov.name AS variety_name, ost.name AS seedling_type_name,
               COUNT(DISTINCT oi.id) AS items_count,
-              GROUP_CONCAT(DISTINCT b.batch_code ORDER BY b.batch_code SEPARATOR ', ') AS batch_codes
+              GROUP_CONCAT(DISTINCT b.batch_code ORDER BY b.batch_code SEPARATOR ', ') AS batch_codes,
+              (SELECT COUNT(*) FROM greenhouse_order_items goi WHERE goi.order_id = o.id) AS greenhouse_items_count,
+              (SELECT COALESCE(SUM(amount), 0) FROM payments p WHERE p.order_id = o.id) AS total_paid
        FROM orders o
        JOIN locations l ON l.id = o.location_id
        LEFT JOIN users cu ON cu.id = o.created_by
@@ -259,7 +267,18 @@ router.get(
       [orderId]
     );
 
-    return sendOk(res, { order, items });
+    await ensureGreenhouseOrderItemsTable(pool);
+    const [greenhouseItems] = await pool.query(
+      `SELECT goi.*, st.name AS seedling_type_name, v.name AS variety_name, NULL AS batch_code
+       FROM greenhouse_order_items goi
+       LEFT JOIN seedling_types st ON st.id = goi.seedling_type_id
+       LEFT JOIN varieties v ON v.id = goi.variety_id
+       WHERE goi.order_id = ?
+       ORDER BY goi.id ASC`,
+      [orderId]
+    );
+
+    return sendOk(res, { order, items: [...items, ...greenhouseItems] });
   })
 );
 
@@ -557,6 +576,159 @@ router.post(
     });
 
     return sendCreated(res, result, "Buyurtma yaratildi (hozircha eslatma sifatida — sotish uchun \"Sotish\"ni bosing).");
+  })
+);
+
+// ─── POST /api/orders/greenhouse-sale — Ko'p navli to'g'ridan-to'g'ri savdo ───
+// Savdo sahifasidagi "Yangi savdo": bir nechta nav/turni bitta buyurtmaga yig'adi,
+// har biri o'z narxi bilan. Eslatma bosqichisiz — to'g'ridan-to'g'ri haqiqiy sotuv
+// (record_type='order'), xuddi partiyadan buyurtma kabi. Har bir band uchun hozirgi
+// "tayyor" bosqich mavjudligi tekshiriladi (faqat ma'lumot uchun — bron bloklanmaydi).
+// To'langan summa kiritilsa, "payments" jadvaliga ham yoziladi — shu bilan Moliya
+// bo'limi darhol shu sotuvni ko'radi va qarzdorlik ikkala joyda ham bir xil hisoblanadi.
+router.post(
+  "/greenhouse-sale",
+  authorize("admin", "bosh_agranom", "bugalter"),
+  asyncHandler(async (req, res) => {
+    requireFields(req.body, ["customerName", "locationId", "items"]);
+
+    if (!Array.isArray(req.body.items) || req.body.items.length === 0) {
+      throw new AppError("Kamida bitta nav tanlanishi kerak.", 400);
+    }
+
+    const pool = getPool();
+    await ensureVarietyStockTable(pool);
+    await ensureGreenhouseOrderItemsTable(pool);
+    await ensureOrderColumns(pool);
+
+    const locationId = toPositiveInt(req.body.locationId, "locationId");
+    const paymentMethod = ["cash", "card", "transfer", "other"].includes(req.body.paymentMethod)
+      ? req.body.paymentMethod
+      : "cash";
+    const paidAmount = toNumber(req.body.paidAmount || 0, "paidAmount", 0);
+    const orderDate = req.body.orderDate ? new Date(req.body.orderDate) : new Date();
+    const expectedDate = req.body.expectedDate ? new Date(req.body.expectedDate) : null;
+
+    const result = await withTransaction(async (conn) => {
+      await ensureLocationExists(conn, locationId);
+
+      let totalQuantity = 0;
+      let totalAmount = 0;
+      let totalImmediate = 0;
+      const parsedItems = [];
+
+      for (const item of req.body.items) {
+        requireFields(item, ["quantity"]);
+        const quantity = toPositiveInt(item.quantity, "quantity");
+        const unitPrice = toNumber(item.unitPrice || 0, "unitPrice", 0);
+        const varietyId = item.varietyId ? Number(item.varietyId) : 0;
+        const seedlingTypeId = item.seedlingTypeId ? Number(item.seedlingTypeId) : 0;
+        const rootstockTypeId = item.rootstockTypeId ? Number(item.rootstockTypeId) : 0;
+        const totalPrice = quantity * unitPrice;
+
+        const [[availRow]] = await conn.query(
+          `SELECT COALESCE(SUM(quantity), 0) AS avail FROM greenhouse_variety_stock
+           WHERE location_id = ? AND stage = 'ready'
+             AND ((variety_id = ? AND seedling_type_id = ?) OR (variety_id = 0 AND seedling_type_id = 0))`,
+          [locationId, varietyId, seedlingTypeId]
+        );
+        const available = Number(availRow?.avail || 0);
+        const immediateQty = Math.min(available, quantity);
+
+        totalQuantity += quantity;
+        totalAmount += totalPrice;
+        totalImmediate += immediateQty;
+
+        parsedItems.push({ varietyId, seedlingTypeId, rootstockTypeId, quantity, unitPrice, totalPrice, immediateQty });
+      }
+
+      const totalShortage = totalQuantity - totalImmediate;
+      // Har bir band uchun shortage_quantity har doim to'liq miqdorga teng (fulfilled=0
+      // yaratilganda) — shuning uchun order darajasidagi status ham har doim "partial"
+      // bo'lishi kerak, "yangi"/"to'liq mavjud" holatiga qarab emas. Aks holda order.status='new'
+      // bo'lganda order.shortage_quantity=0 deb yozilardi-yu, lekin har bir bandning o'zi hali
+      // "berilmagan" (shortage=quantity) qolardi — bu ikkalasi mos kelmay, "Bandlarni berish"
+      // oynasida bandlar ko'rinmay qolar edi. To'liq mavjud bo'lsa ham "Bandlarni berish"
+      // orqali bir bosishda berib yuboriladi (order_items shortage=to'liq miqdor bo'lgani uchun).
+      const status = "partial";
+      const orderNumber = req.body.orderNumber || generateCode("ORD");
+
+      const [orderResult] = await conn.query(
+        `INSERT INTO orders
+          (order_number, client_name, customer_name, customer_phone, location_id, status, record_type,
+           order_date, note, notes, total_amount, total_quantity, quantity,
+           fulfilled_quantity, shortage_quantity, expected_date, batch_id, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, 'order', ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?)`,
+        [
+          orderNumber,
+          req.body.customerName,
+          req.body.customerName,
+          req.body.customerPhone || null,
+          locationId,
+          status,
+          orderDate,
+          req.body.notes || null,
+          req.body.notes || null,
+          totalAmount,
+          totalQuantity,
+          totalQuantity,
+          totalQuantity,
+          expectedDate,
+          req.user.id,
+        ]
+      );
+      const orderId = orderResult.insertId;
+
+      for (const item of parsedItems) {
+        await conn.query(
+          `INSERT INTO greenhouse_order_items
+            (order_id, variety_id, seedling_type_id, rootstock_type_id, quantity, unit_price, total_price,
+             fulfilled_quantity, shortage_quantity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+          [orderId, item.varietyId, item.seedlingTypeId, item.rootstockTypeId, item.quantity, item.unitPrice, item.totalPrice, item.quantity]
+        );
+      }
+
+      if (paidAmount > 0) {
+        await conn.query(
+          `INSERT INTO payments (order_id, amount, payment_method, payment_date, created_by)
+           VALUES (?, ?, ?, NOW(), ?)`,
+          [orderId, Math.min(paidAmount, totalAmount), paymentMethod, req.user.id]
+        );
+      }
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "order_created",
+        entityType: "order",
+        entityId: orderId,
+        description: `${orderNumber} savdosi (${parsedItems.length} ta nav) yaratildi`,
+        metadata: { locationId, totalQuantity, totalAmount, itemCount: parsedItems.length },
+      });
+
+      const notificationRecipientIds = await getOrderNotificationRecipientIds(conn, locationId);
+      await createNotifications(conn, notificationRecipientIds, {
+        type: "order_created",
+        title: "Yangi savdo",
+        message: `${orderNumber}: ${req.body.customerName}, ${parsedItems.length} ta nav, ${totalQuantity} ta`,
+        entityType: "order",
+        entityId: orderId,
+        locationId,
+        createdBy: req.user.id,
+      });
+
+      return {
+        orderId,
+        orderNumber,
+        status,
+        totalAmount,
+        totalQuantity,
+        immediateQuantity: totalImmediate,
+        shortageQuantity: totalShortage,
+      };
+    });
+
+    return sendCreated(res, result, "Savdo yaratildi.");
   })
 );
 
@@ -1092,12 +1264,150 @@ router.post(
   })
 );
 
+// ─── POST /api/orders/:id/deliver-items — Ko'p navli savdoda har bir band uchun
+// alohida qisman/to'liq berish. Har bir { itemId, quantity } juftligi shu bandning
+// shortage_quantity dan kamaytiriladi va haqiqiy "tayyor" bosqich stokidan yechiladi.
+// Barcha bandlar 0 shortage ga yetganda butun buyurtma "completed" bo'ladi.
+router.post(
+  "/:id/deliver-items",
+  authorize("admin", "agranom"),
+  asyncHandler(async (req, res) => {
+    await ensureGreenhouseOrderItemsTable(getPool());
+
+    const result = await withTransaction(async (conn) => {
+      const orderId = toPositiveInt(req.params.id, "orderId");
+      const deliveries = Array.isArray(req.body.deliveries) ? req.body.deliveries : [];
+      if (!deliveries.length) {
+        throw new AppError("Kamida bitta band uchun miqdor kiritilishi kerak.", 400);
+      }
+
+      const order = await fetchOne(
+        conn,
+        "SELECT * FROM orders WHERE id = ? LIMIT 1 FOR UPDATE",
+        [orderId]
+      );
+      if (!order) throw new AppError("Buyurtma topilmadi.", 404);
+      if (["completed", "cancelled"].includes(order.status)) {
+        throw new AppError("Bu buyurtma allaqachon yakunlangan yoki bekor qilingan.", 400);
+      }
+      if (req.user.role === "agranom" && req.user.locationId !== order.location_id) {
+        throw new AppError("Siz faqat o'zingizga biriktirilgan lokatsiya buyurtmasini bajarishingiz mumkin.", 403);
+      }
+
+      let deliveredTotal = 0;
+      for (const delivery of deliveries) {
+        const itemId = toPositiveInt(delivery.itemId, "itemId");
+        const deliverQuantity = toPositiveInt(delivery.quantity, "quantity");
+
+        const item = await fetchOne(
+          conn,
+          "SELECT * FROM greenhouse_order_items WHERE id = ? AND order_id = ? LIMIT 1 FOR UPDATE",
+          [itemId, orderId]
+        );
+        if (!item) throw new AppError(`Band #${itemId} topilmadi.`, 404);
+
+        const remainingShortage = Number(item.shortage_quantity || 0);
+        if (deliverQuantity > remainingShortage) {
+          throw new AppError(
+            `Band #${itemId} uchun berilayotgan miqdor (${deliverQuantity}) bron qoldiqdan (${remainingShortage}) ko'p bo'lmasligi kerak.`,
+            400
+          );
+        }
+
+        await assertVarietyStockAvailable(conn, order.location_id, "ready", item.variety_id, item.seedling_type_id, deliverQuantity);
+        await drainVarietyStockForSale(conn, order.location_id, "ready", item.variety_id, item.seedling_type_id, deliverQuantity);
+
+        await conn.query(
+          `UPDATE greenhouse_stage_stock SET quantity = GREATEST(0, quantity - ?)
+           WHERE location_id = ? AND stage = 'ready'`,
+          [deliverQuantity, order.location_id]
+        );
+        await conn.query(
+          `INSERT INTO greenhouse_stage_log
+            (location_id, action_date, from_stage, to_stage, quantity, notes, created_by,
+             action_type, seedling_type_id, variety_id, rootstock_type_id, variety_quantity)
+           VALUES (?, DATE(NOW()), 'ready', 'sold', ?, ?, ?, 'sale', ?, ?, NULL, ?)`,
+          [order.location_id, deliverQuantity,
+           `Savdo ${order.order_number} (band #${itemId}) bo'yicha berildi`,
+           req.user.id, item.seedling_type_id || null, item.variety_id || null, deliverQuantity]
+        );
+
+        await conn.query(
+          `UPDATE greenhouse_order_items
+           SET fulfilled_quantity = fulfilled_quantity + ?, shortage_quantity = shortage_quantity - ?
+           WHERE id = ?`,
+          [deliverQuantity, deliverQuantity, itemId]
+        );
+
+        deliveredTotal += deliverQuantity;
+      }
+
+      const [[aggRow]] = await conn.query(
+        `SELECT COALESCE(SUM(fulfilled_quantity),0) AS fulfilled, COALESCE(SUM(shortage_quantity),0) AS shortage
+         FROM greenhouse_order_items WHERE order_id = ?`,
+        [orderId]
+      );
+      const newFulfilled = Number(aggRow.fulfilled || 0);
+      const newShortage = Number(aggRow.shortage || 0);
+      const newStatus = newShortage <= 0 ? "completed" : "partial";
+
+      await conn.query(
+        `UPDATE orders
+         SET fulfilled_quantity = ?, shortage_quantity = ?, status = ?, updated_at = NOW()
+             ${newStatus === "completed" ? ", sold_by = ?, sold_at = NOW()" : ""}
+         WHERE id = ?`,
+        newStatus === "completed"
+          ? [newFulfilled, newShortage, newStatus, req.user.id, orderId]
+          : [newFulfilled, newShortage, newStatus, orderId]
+      );
+
+      await logActivity(conn, {
+        actorUserId: req.user.id,
+        action: "order_items_delivered",
+        entityType: "order",
+        entityId: orderId,
+        description: `${order.order_number}: ${deliveredTotal} ta berildi (qoldi: ${newShortage})`,
+        metadata: { deliveredTotal, newFulfilled, newShortage, newStatus },
+      });
+
+      const recipientIds = await getNotificationRecipientIds(conn, {
+        roles: ["admin", "bosh_agranom"],
+        locationIds: [order.location_id],
+        excludeUserIds: [req.user.id],
+      });
+      await createNotifications(conn, recipientIds, {
+        type: "order_partial_fulfilled",
+        title: newStatus === "completed" ? "Savdo to'liq bajarildi" : "Savdo qisman bajarildi",
+        message: newStatus === "completed"
+          ? `${order.order_number} savdosi to'liq bajarildi`
+          : `${order.order_number}: ${deliveredTotal} ta berildi, ${newShortage} ta bron qoldi`,
+        entityType: "order",
+        entityId: orderId,
+        locationId: order.location_id,
+        createdBy: req.user.id,
+      });
+
+      return {
+        id: orderId,
+        orderNumber: order.order_number,
+        status: newStatus,
+        fulfilledQuantity: newFulfilled,
+        shortageQuantity: newShortage,
+        deliveredNow: deliveredTotal,
+      };
+    });
+
+    return sendOk(res, result, "Bandlar muvaffaqiyatli berildi.");
+  })
+);
+
 // ─── DELETE /api/orders/:id — Admin buyurtmani o'chirish ─────────────────────
 router.delete(
   "/:id",
   authorize("admin"),
   asyncHandler(async (req, res) => {
     const pool = getPool();
+    await ensureGreenhouseOrderItemsTable(pool);
     const orderId = toPositiveInt(req.params.id, "orderId");
 
     const order = await fetchOne(
@@ -1112,6 +1422,7 @@ router.delete(
 
     await withTransaction(async (conn) => {
       await conn.query("DELETE FROM order_items WHERE order_id = ?", [orderId]);
+      await conn.query("DELETE FROM greenhouse_order_items WHERE order_id = ?", [orderId]);
       await conn.query("DELETE FROM orders WHERE id = ?", [orderId]);
 
       await logActivity(conn, {

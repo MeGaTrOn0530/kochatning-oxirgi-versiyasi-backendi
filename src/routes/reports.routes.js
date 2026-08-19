@@ -3,6 +3,7 @@ import { getPool } from "../config/database.js";
 import asyncHandler from "../utils/async-handler.js";
 import { authenticate, authorize } from "../middlewares/auth.middleware.js";
 import { sendOk } from "../utils/http.js";
+import { ensureGreenhouseOrderItemsTable } from "../utils/greenhouse-stock.js";
 
 const router = Router();
 
@@ -635,11 +636,38 @@ router.get(
       params
     );
 
+    // Nav (variety) bo'yicha — partiyadan buyurtmalar (order_items) va teplitsadagi
+    // ko'p navli savdolar (greenhouse_order_items) birlashtirilib hisoblanadi.
+    await ensureGreenhouseOrderItemsTable(pool);
+    const [byVariety] = await pool.query(
+      `SELECT COALESCE(v.name, 'Aniqlanmagan') AS varietyName,
+              SUM(x.quantity) AS soldQty,
+              SUM(x.total_price) AS revenue
+       FROM (
+         SELECT oi.quantity AS quantity, oi.total_price AS total_price, b.variety_id AS variety_id
+         FROM order_items oi
+         JOIN orders o ON o.id = oi.order_id
+         LEFT JOIN seedling_batches b ON b.id = oi.batch_id
+         ${completedWhere}
+         UNION ALL
+         SELECT goi.quantity AS quantity, goi.total_price AS total_price, goi.variety_id AS variety_id
+         FROM greenhouse_order_items goi
+         JOIN orders o ON o.id = goi.order_id
+         ${completedWhere}
+       ) x
+       LEFT JOIN varieties v ON v.id = x.variety_id
+       GROUP BY v.id, v.name
+       ORDER BY revenue DESC
+       LIMIT 20`,
+      [...params, ...params]
+    );
+
     return sendOk(res, {
       summary: summary[0] || {},
       byLocation,
       byMonth,
-      bySeedlingType
+      bySeedlingType,
+      byVariety
     });
   })
 );
