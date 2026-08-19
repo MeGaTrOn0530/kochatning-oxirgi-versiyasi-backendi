@@ -226,6 +226,31 @@ router.get(
       params
     );
 
+    // Ko'p navli teplitsa savdolari uchun har bir bandni ham qo'shib beramiz — Savdo
+    // sahifasi kartochkada "qaysi navdan qancha" degan qisqa tarkibni to'g'ridan-to'g'ri
+    // shu ro'yxatdan (qo'shimcha so'rovsiz) ko'rsata oladi.
+    const multiItemOrderIds = rows.filter((r) => Number(r.greenhouse_items_count || 0) > 0).map((r) => r.id);
+    if (multiItemOrderIds.length > 0) {
+      const [itemRows] = await pool.query(
+        `SELECT goi.order_id, goi.quantity, goi.unit_price, goi.total_price,
+                st.name AS seedling_type_name, v.name AS variety_name
+         FROM greenhouse_order_items goi
+         LEFT JOIN seedling_types st ON st.id = goi.seedling_type_id
+         LEFT JOIN varieties v ON v.id = goi.variety_id
+         WHERE goi.order_id IN (?)
+         ORDER BY goi.id ASC`,
+        [multiItemOrderIds]
+      );
+      const itemsByOrder = new Map();
+      for (const item of itemRows) {
+        if (!itemsByOrder.has(item.order_id)) itemsByOrder.set(item.order_id, []);
+        itemsByOrder.get(item.order_id).push(item);
+      }
+      for (const row of rows) {
+        row.greenhouse_items = itemsByOrder.get(row.id) || [];
+      }
+    }
+
     return sendOk(res, rows);
   })
 );
